@@ -42,6 +42,12 @@ async def init_db():
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS channels (
+                channel_id INTEGER PRIMARY KEY,
+                channel_title TEXT
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
@@ -69,6 +75,7 @@ class BotStates(StatesGroup):
     waiting_for_welcome = State()
     waiting_for_broadcast = State()
     waiting_for_restore_file = State()
+    waiting_for_channel_post = State()
 
 # Helper Functions for Settings
 async def get_welcome_message():
@@ -93,7 +100,7 @@ def main_menu_keyboard():
         [InlineKeyboardButton(text="📊 Dashboard & Stats", callback_data="stats")],
         [InlineKeyboardButton(text="⚙️ Set Welcome Message", callback_data="set_welcome")],
         [InlineKeyboardButton(text="📢 Broadcast Message", callback_data="broadcast")],
-        [InlineKeyboardButton(text="➕ Add Bot to Channel", callback_data="add_channel")],
+        [InlineKeyboardButton(text="➕ Add Channel (By Sharing Post)", callback_data="add_channel")],
         [InlineKeyboardButton(text="💾 Backup Data", callback_data="backup_data"),
          InlineKeyboardButton(text="🔄 Restore Data", callback_data="restore_data")]
     ])
@@ -105,11 +112,12 @@ def back_to_menu_keyboard():
 
 # /start Command Handler
 @router.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         await message.answer("⚠️ You are not authorized to use this bot.")
         return
 
+    await state.clear()
     welcome_caption = (
         "🤖 **Channel Automation & Manager Bot**\n\n"
         "Welcome Boss! Use the control panel buttons below to manage your channels, "
@@ -140,7 +148,7 @@ async def cb_stats(callback: CallbackQuery):
         async with db.execute("SELECT COUNT(*) FROM users") as cursor:
             total_users = (await cursor.fetchone())[0]
         
-        async with db.execute("SELECT COUNT(DISTINCT channel_id) FROM users") as cursor:
+        async with db.execute("SELECT COUNT(*) FROM channels") as cursor:
             channels_count = (await cursor.fetchone())[0]
     
     stats_text = (
@@ -152,50 +160,76 @@ async def cb_stats(callback: CallbackQuery):
     await callback.message.edit_text(stats_text, reply_markup=back_to_menu_keyboard(), parse_mode="Markdown")
     await callback.answer()
 
-# Callback: Add Channel
+# Callback: Add Channel Prompt
 @router.callback_query(F.data == "add_channel")
-async def cb_add_channel(callback: CallbackQuery):
+async def cb_add_channel(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return
     
-    bot_info = await bot.get_me()
-    bot_username = bot_info.username
-    # Force channel selection popup link
-    add_link = f"https://t.me/{bot_username}?startgroup=true&admin=invite_users+manage_chat"
-    
     text = (
-        "➕ **Add Bot to Channel:**\n\n"
-        "Click the button below. Telegram will open a selection list—**please select your Channel** and give it admin permission to invite users.\n\n"
-        "💡 *Note:* Once added, the bot will instantly send a confirmation popup here!"
+        "➕ **Add Channel Manually:**\n\n"
+        "1. Make sure you have added this bot as an **Administrator** in your channel with **'Invite Users'** permission.\n"
+        "2. Now, go to your channel, take **any post** and **forward or share it here in this chat**."
     )
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Select Channel & Add Bot", url=add_link)],
-        [InlineKeyboardButton(text="🔙 Back to Menu", callback_data="main_menu")]
-    ])
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.message.edit_text(text, reply_markup=back_to_menu_keyboard(), parse_mode="Markdown")
+    await state.set_state(BotStates.waiting_for_channel_post)
     await callback.answer()
 
-# Bot added to a Channel / Group popup notification trigger
-@router.my_chat_member()
-async def bot_added_handler(event: ChatMemberUpdated):
-    if event.chat.type in ["channel", "supergroup", "group"]:
-        new_status = event.new_chat_member.status
-        if new_status in ["administrator", "member"]:
-            chat_title = event.chat.title
-            chat_type = event.chat.type.capitalize()
-            # Send instant popup notification to admin inbox
-            try:
-                await bot.send_message(
-                    chat_id=ADMIN_ID,
-                    text=(
-                        f"🔔 **Successfully Added!**\n\n"
-                        f"📌 **{chat_type}:** `{chat_title}`\n"
-                        f"✅ The bot is now successfully connected and ready to accept join requests!"
-                    ),
-                    parse_mode="Markdown"
-                )
-            except Exception as e:
-                logging.error(f"Failed to send add notification: {e}")
+# Handle Forwarded Channel Post to Register Channel
+@router.message(BotStates.waiting_for_channel_post)
+async def process_channel_post(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    # Check if the message is forwarded from a channel
+    if not message.forward_from_chat or message.forward_from_chat.type != "channel":
+        await message.answer(
+            "⚠️ **Invalid!** This is not a channel post.\nPlease forward a post from your **Channel** where the bot is an admin.",
+            reply_markup=back_to_menu_keyboard()
+        )
+        return
+    
+    chat = message.forward_from_chat
+    channel_id = chat.id
+    channel_title = chat.title
+
+    try:
+        # Check if bot is admin in that channel
+        bot_member = await bot.get_chat_member(chat_id=channel_id, user_id=bot.id)
+        if bot_member.status not in ["administrator", "creator"]:
+            await message.answer(
+                f"❌ **Failed!** The bot is not an administrator in `{channel_title}`.\nPlease make the bot an admin first and try again.",
+                reply_markup=main_menu_keyboard(),
+                parse_mode="Markdown"
+            )
+            await state.clear()
+            return
+
+        # Save channel to database
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(
+                "INSERT INTO channels (channel_id, channel_title) VALUES (?, ?) ON CONFLICT(channel_id) DO UPDATE SET channel_title = ?",
+                (channel_id, channel_title, channel_title)
+            )
+            await db.commit()
+
+        await state.clear()
+        await message.answer(
+            f"✅ **Channel Added Successfully!**\n\n"
+            f"📌 **Channel:** `{channel_title}`\n"
+            f"🆔 ID: `{channel_id}`\n\n"
+            f"The bot is now ready to accept join requests for this channel!",
+            reply_markup=main_menu_keyboard(),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logging.error(f"Error adding channel: {e}")
+        await message.answer(
+            f"❌ **Error:** Failed to verify channel. Make sure the bot is added as an admin!\n\nDetails: `{e}`",
+            reply_markup=main_menu_keyboard(),
+            parse_mode="Markdown"
+        )
+        await state.clear()
 
 # Callback: Manual Backup Button
 @router.callback_query(F.data == "backup_data")
@@ -348,6 +382,7 @@ async def handle_join_request(join_request: ChatJoinRequest):
         await join_request.approve()
         
         async with aiosqlite.connect(DB_FILE) as db:
+            # Save user
             await db.execute("""
                 INSERT INTO users (user_id, username, first_name, channel_id, channel_title)
                 VALUES (?, ?, ?, ?, ?)
@@ -357,6 +392,12 @@ async def handle_join_request(join_request: ChatJoinRequest):
                     channel_id = excluded.channel_id,
                     channel_title = excluded.channel_title
             """, (user.id, user.username, user.first_name, chat.id, chat.title))
+            
+            # Ensure channel is also logged if join request comes in
+            await db.execute(
+                "INSERT INTO channels (channel_id, channel_title) VALUES (?, ?) ON CONFLICT(channel_id) DO NOTHING",
+                (chat.id, chat.title)
+            )
             await db.commit()
         
         welcome_template = await get_welcome_message()
