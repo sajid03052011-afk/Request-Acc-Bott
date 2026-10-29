@@ -6,7 +6,7 @@ from threading import Thread
 from flask import Flask
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import (
-    Message, CallbackQuery, ChatJoinRequest,
+    Message, CallbackQuery, ChatJoinRequest, ChatMemberUpdated,
     InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 )
 from aiogram.filters import Command
@@ -103,7 +103,7 @@ def back_to_menu_keyboard():
         [InlineKeyboardButton(text="🔙 Back to Menu", callback_data="main_menu")]
     ])
 
-# /start Command Handler (Restricted to Admin Only)
+# /start Command Handler
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -160,19 +160,42 @@ async def cb_add_channel(callback: CallbackQuery):
     
     bot_info = await bot.get_me()
     bot_username = bot_info.username
+    # Force channel selection popup link
     add_link = f"https://t.me/{bot_username}?startgroup=true&admin=invite_users+manage_chat"
     
     text = (
-        "➕ **Add Bot to Multiple Channels:**\n\n"
-        "Click the button below to add this bot as an **Administrator** to any of your channels.\n\n"
-        "💡 *Note:* Make sure to give it permissions to **'Invite Users via Link'** or **'Manage Chat'**."
+        "➕ **Add Bot to Channel:**\n\n"
+        "Click the button below. Telegram will open a selection list—**please select your Channel** and give it admin permission to invite users.\n\n"
+        "💡 *Note:* Once added, the bot will instantly send a confirmation popup here!"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Add to Channel / Group", url=add_link)],
+        [InlineKeyboardButton(text="🔗 Select Channel & Add Bot", url=add_link)],
         [InlineKeyboardButton(text="🔙 Back to Menu", callback_data="main_menu")]
     ])
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
+
+# Bot added to a Channel / Group popup notification trigger
+@router.my_chat_member()
+async def bot_added_handler(event: ChatMemberUpdated):
+    if event.chat.type in ["channel", "supergroup", "group"]:
+        new_status = event.new_chat_member.status
+        if new_status in ["administrator", "member"]:
+            chat_title = event.chat.title
+            chat_type = event.chat.type.capitalize()
+            # Send instant popup notification to admin inbox
+            try:
+                await bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        f"🔔 **Successfully Added!**\n\n"
+                        f"📌 **{chat_type}:** `{chat_title}`\n"
+                        f"✅ The bot is now successfully connected and ready to accept join requests!"
+                    ),
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logging.error(f"Failed to send add notification: {e}")
 
 # Callback: Manual Backup Button
 @router.callback_query(F.data == "backup_data")
